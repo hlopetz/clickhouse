@@ -602,81 +602,52 @@ describe('queries', () => {
 	});
 
 	it('restreaming with chunks', async () => {
-		const chunkSize = 10;
-		const result = await clickhouse.query('DROP TABLE IF EXISTS session_temp').toPromise();
-		expect(result).to.be.ok();
-		
-		const result2 = await clickhouse.query('DROP TABLE IF EXISTS session_temp2').toPromise();
+		const result2 = await clickhouse.query('DROP TABLE IF EXISTS session_temp3').toPromise();
 		expect(result2).to.be.ok();
 		
-		const result3 = await clickhouse.query('CREATE TABLE session_temp (str String) ENGINE=MergeTree PARTITION BY tuple() ORDER BY tuple()').toPromise();
-		expect(result3).to.be.ok();
-		
-		const result4 = await clickhouse.query('CREATE TABLE session_temp2 (val Int8, str String) ENGINE=MergeTree PARTITION BY tuple() ORDER BY tuple()').toPromise();
+		const result4 = await clickhouse.query('CREATE TABLE session_temp3 (number UInt32, str String, date Date) ENGINE=MergeTree PARTITION BY tuple() ORDER BY tuple()').toPromise();
 		expect(result4).to.be.ok();
 		
-		const data = _.range(0, chunkSize * 3).map(r => [r]);
-		const result5 = await clickhouse.insert(
-			'INSERT INTO session_temp', data
-		).toPromise();
-		expect(result5).to.be.ok();
+		const rowCount = 100000;
+		const sql = `SELECT
+			number,
+			toString(number * 2) AS str,
+			toDate(number + 1) AS date
+		  FROM system.numbers
+		  LIMIT ${rowCount}`;
 		
-		const rows = await clickhouse.query('SELECT COUNT(*) AS count FROM session_temp').toPromise();
-		expect(rows).to.be.ok();
-		expect(rows).to.have.length(1);
-		expect(rows[0]).to.have.key('count');
-		expect(rows[0].count).to.be(data.length);
-		expect(rows[0].count).to.be(chunkSize * 3);
-		
-		const tabify = (obj) => {
-			let text = '';
-			let first_col = true;
-			for (let key in obj) {
-				let val = obj[key];
-				if (first_col) {
-					first_col = false
-				} else {
-					text += '\t';
-				}
-				text += val ? val : '\N';
-			}
-			return text;
-		};
-
-		let cnt = 0;
-		const tf = new stream.Transform({
-			objectMode : true,
-			transform  : function (chunk, enc, cb) {
-				let val = parseInt(chunk.str);
-				if (1 == val % 10 ) {
-					// skip 10%
-					cb(null, null);
-				} else {
-					chunk.val = val * 10;
-					// not sure why JSON.stringify does not work
-					// cb(null, JSON.stringify(chunk) + '\n');
-					cb(null, tabify(chunk) + '\n');
-					cnt++;
-				}
-			}
-		});
-
-		// specifying session here leads to: Invalid JSON (Unexpected "C" at position 0 in state STOP)
-		// clickhouse.sessionId = Date.now();
-		let offset = 0;
+		clickhouse.isUseGzip = true;
 		for (let i = 0; i < 3; i++) {
-			console.log(`i: ${i}`);
-			let rs = clickhouse.query(`SELECT str FROM session_temp LIMIT ${offset}, ${chunkSize}`).stream();
-			let ws = clickhouse.insert('INSERT INTO session_temp2 (val, str)').stream();
-			let result8 = await rs.pipe(tf).pipe(ws).exec();
-			ws.destroy();
-			rs.destroy();
-			console.log(`cnt: ${cnt}`);
+			const offset = i * rowCount;
+			const rs = clickhouse.query(sql).stream();
+
+			const tf = new stream.Transform({
+				objectMode: true,
+				transform: function (obj, enc, cb) {
+					if (1 == obj.number % 10) {
+						// skip 10%
+						cb(null, null);
+					} else {
+						let fields = [
+							obj.number + offset,
+							obj.str,
+							obj.date
+						];
+						// Need to add check and handling for undefined fields.  NOTE values can be falsey but not undefined/null.  
+						cb(null, fields.join("\t") + "\n");
+					}
+				}
+			});
+
+			clickhouse.sessionId = Date.now();
+			const ws2 = clickhouse.insert('INSERT INTO session_temp3').stream();
+
+			const result8 = await rs.pipe(tf).pipe(ws2).exec();
 			expect(result8).to.be.ok();
-			offset += chunkSize;
 		}
-		const result10 = await clickhouse.query('SELECT count(*) AS count FROM session_temp2').toPromise();
-		expect(chunkSize * .9 * 3).to.eql(result10[0].count);
+		clickhouse.isUseGzip = false;
+		const result10 = await clickhouse.query('SELECT count(*) AS count FROM session_temp3').toPromise();
+		expect(result10[0].count).to.eql(rowCount * 3 * .9);
 	});
 	
 	it('insert && errors', async () => {
